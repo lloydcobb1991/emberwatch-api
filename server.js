@@ -4,6 +4,7 @@
 
 import express from 'express';
 import cors from 'cors';
+import contactsRouter from './contacts.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -41,7 +42,7 @@ app.use(express.json({ limit: '50mb' }));
 app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'emberwatch-api' });
 });
-app.use('/api', require('./contacts'));
+app.use('/api', contactsRouter);
 // ----------------------------------------------------------------------------
 // POST /api/analyze
 // Pass-through proxy to Anthropic. Frontend builds the full Claude request
