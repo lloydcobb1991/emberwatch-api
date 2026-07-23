@@ -5,6 +5,7 @@
 import express from 'express';
 import cors from 'cors';
 import contactsRouter from './contacts.js';
+import brandNewsRouter from './brand-news.js'; 
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -43,6 +44,7 @@ app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'emberwatch-api' });
 });
 app.use('/api', contactsRouter);
+app.use('/api', brandNewsRouter); 
 // ----------------------------------------------------------------------------
 // POST /api/analyze
 // Pass-through proxy to Anthropic. Frontend builds the full Claude request
