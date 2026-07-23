@@ -1,10 +1,13 @@
 // ---------------------------------------------------------------------------
 // contacts.js — venue-manager address book, backed by Airtable.
 //
-// Self-contained Express router. Mount it in your existing server file with a
-// single line, placed AFTER your cors() and express.json() middleware:
+// Self-contained Express router, written as an ES module to match this repo
+// (package.json has "type": "module"). Mount it in server.js with two lines:
 //
-//     app.use('/api', require('./contacts'));
+//     import contactsRouter from './contacts.js';   // with the other imports
+//     app.use('/api', contactsRouter);              // after cors + express.json
+//
+// The .js extension in that import path is required in ESM, unlike CommonJS.
 //
 // Required Railway variables:
 //     AIRTABLE_API_KEY   Personal access token (needs data.records:read+write)
@@ -24,7 +27,8 @@
 // means a new venue name fails the write instead of creating itself.
 // ---------------------------------------------------------------------------
 
-const express = require('express');
+import express from 'express';
+
 const router = express.Router();
 
 const API_KEY = process.env.AIRTABLE_API_KEY;
@@ -218,4 +222,4 @@ router.post('/contacts', async (req, res) => {
   }
 });
 
-module.exports = router;
+export default router;
