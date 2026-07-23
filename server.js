@@ -123,8 +123,13 @@ app.post('/api/send-emails', async (req, res) => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          personalizations: [
-            { to: [{ email: email.to }], subject: email.subject },
+        personalizations: [
+            {
+              to: (Array.isArray(email.to) ? email.to : [email.to])
+                .filter(Boolean)
+                .map((address) => ({ email: address })),
+              subject: email.subject,
+            },
           ],
           from: {
             email: process.env.FROM_EMAIL,
