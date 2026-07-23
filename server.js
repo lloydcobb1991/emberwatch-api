@@ -41,7 +41,7 @@ app.use(express.json({ limit: '50mb' }));
 app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'emberwatch-api' });
 });
-
+app.use('/api', require('./contacts'));
 // ----------------------------------------------------------------------------
 // POST /api/analyze
 // Pass-through proxy to Anthropic. Frontend builds the full Claude request
