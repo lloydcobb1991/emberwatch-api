@@ -5,7 +5,8 @@
 import express from 'express';
 import cors from 'cors';
 import contactsRouter from './contacts.js';
-import brandNewsRouter from './brand-news.js'; 
+import brandNewsRouter from './brand-news.js';
+import rfpRouter from './rfp.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
