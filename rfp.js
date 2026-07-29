@@ -61,6 +61,32 @@ const F = {
 
 const configured = () => Boolean(KEY && BASE);
 
+// --- reminder engine config ------------------------------------------------
+
+const SENDGRID_KEY = process.env.SENDGRID_API_KEY;
+const FROM_EMAIL = process.env.FROM_EMAIL || process.env.SENDGRID_FROM_EMAIL || '';
+const FROM_NAME = process.env.FROM_NAME || process.env.SENDGRID_FROM_NAME || 'Ignite Creative Services';
+
+// Grace: a reminder still fires if it's within this many days past its target
+// day; older than that and it's treated as missed and skipped. Default 0 means
+// "fire only on the exact day, skip anything already past" — which is what makes
+// a late-created RFP skip its already-passed D-7/D-3 windows. Raise it only if
+// you want tolerance for a scheduler outage (see the note in the deploy steps).
+const GRACE_DAYS = Number(process.env.RFP_REMINDER_GRACE_DAYS || 0);
+
+// In-process hourly scheduler. Set RFP_CRON_ENABLED=false to turn it off and
+// drive sweeps manually via POST /api/cron/sweep instead.
+const CRON_ENABLED = process.env.RFP_CRON_ENABLED !== 'false';
+const CRON_SECRET = process.env.RFP_CRON_SECRET || '';
+
+// The three reminder slots, newest-deadline-first is irrelevant here; order is
+// D-7, D-3, D-1. Each maps to its "sent at" and "skipped" fields on the signup.
+const SLOTS = [
+  { key: 'fu1', offset: 7, sentField: F.suFu1, skipField: F.suFu1Skip },
+  { key: 'fu2', offset: 3, sentField: F.suFu2, skipField: F.suFu2Skip },
+  { key: 'fu3', offset: 1, sentField: F.suFu3, skipField: F.suFu3Skip },
+];
+
 // ---------------------------------------------------------------------------
 // Airtable helpers
 // ---------------------------------------------------------------------------
@@ -402,5 +428,244 @@ router.post('/signup', async (req, res) => {
     res.status(e.status || 500).json({ error: e.message });
   }
 });
+
+// ===========================================================================
+// Reminder engine
+// ===========================================================================
+
+// How many whole days is `today` past the target day? Negative = target is in
+// the future. Both are compared at UTC midnight so DST and clock time never
+// enter into it.
+function daysPast(targetMs, utcTodayMs) {
+  return Math.round((utcTodayMs - targetMs) / 86400000);
+}
+
+// Classify a single reminder slot for a given deadline: 'pending' (its day
+// hasn't come), 'due' (fire now), or 'missed' (its day passed — skip silently).
+function classifySlot(offset, dueMs, utcTodayMs) {
+  const targetMs = dueMs - offset * 86400000;
+  const past = daysPast(targetMs, utcTodayMs);
+  if (past < 0) return 'pending';
+  if (past <= GRACE_DAYS) return 'due';
+  return 'missed';
+}
+
+function buildReminderEmail(rfp, signup, offset) {
+  const daysLeft = offset; // by definition, this reminder fires `offset` days out
+  const dueStr = (() => {
+    const d = new Date(`${String(rfp[F.deadline] || rfp.deadline).slice(0, 10)}T00:00:00Z`);
+    return Number.isNaN(d.getTime())
+      ? String(rfp.deadline)
+      : d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+  })();
+
+  const name = signup.name ? ` ${signup.name.split(' ')[0]}` : '';
+  const client = rfp.client ? ` for ${rfp.client}` : '';
+  const dayWord = daysLeft === 1 ? 'day' : 'days';
+  const lpLine = rfp.lp_url ? `\nDetails and submission: ${rfp.lp_url}\n` : '';
+
+  const subject = `Reminder: ${rfp.name} — ${daysLeft} ${dayWord} left`;
+  const text =
+`Hi${name},
+
+A quick reminder that the RFP "${rfp.name}"${client} is due ${dueStr} — ${daysLeft} ${dayWord} from now.
+${lpLine}
+If you've already submitted, thank you and please disregard.
+
+— ${FROM_NAME}`;
+
+  return { subject, text };
+}
+
+async function sendViaSendGrid({ to, subject, text, rfpId }) {
+  if (!SENDGRID_KEY || !FROM_EMAIL) {
+    throw new Error('SendGrid not configured (need SENDGRID_API_KEY and FROM_EMAIL)');
+  }
+  const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${SENDGRID_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      personalizations: [{ to: [{ email: to }], custom_args: { rfp_id: rfpId } }],
+      from: { email: FROM_EMAIL, name: FROM_NAME },
+      subject,
+      content: [{ type: 'text/plain', value: text }],
+      // Categories let the Phase 4 stats/webhook work filter by this RFP.
+      categories: ['rfp-reminder', `rfp:${rfpId}`],
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    const err = new Error(`SendGrid ${res.status}: ${body.slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
+  }
+  return true;
+}
+
+// One full pass. Returns a summary; never throws (per-item errors are collected
+// so one bad address can't abort the whole sweep).
+async function sweepOnce({ dryRun = false } = {}) {
+  const started = new Date().toISOString();
+  const summary = { started, dryRun, rfps: 0, signups: 0, sent: 0, skipped: 0, pending: 0, errors: [], plan: [] };
+
+  if (!configured()) {
+    summary.errors.push('Airtable not configured');
+    return summary;
+  }
+
+  const today = new Date();
+  const utcTodayMs = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
+
+  let rfpRecords;
+  try {
+    rfpRecords = await listAll(RFPS_TABLE);
+  } catch (e) {
+    summary.errors.push(`Load RFPs: ${e.message}`);
+    return summary;
+  }
+
+  for (const rec of rfpRecords) {
+    const f = rec.fields || {};
+    const status = f[F.status] || 'active';
+    const deadline = f[F.deadline];
+    if (status !== 'active' || !deadline) continue;
+
+    const dueMs = (() => {
+      const d = new Date(`${String(deadline).slice(0, 10)}T00:00:00Z`);
+      return Number.isNaN(d.getTime()) ? null : d.getTime();
+    })();
+    if (dueMs == null) continue;
+
+    summary.rfps += 1;
+    const rfpShaped = shapeRfp(rec);
+
+    // Pull this RFP's signups.
+    let signups;
+    try {
+      const formula = `{${F.suRfpId}}="${esc(rec.id)}"`;
+      signups = await listAll(SIGNUPS_TABLE, `?filterByFormula=${encodeURIComponent(formula)}`);
+    } catch (e) {
+      summary.errors.push(`RFP ${rec.id} signups: ${e.message}`);
+      continue;
+    }
+
+    for (const su of signups) {
+      summary.signups += 1;
+      const sf = su.fields || {};
+      const suShaped = shapeSignup(su);
+
+      for (const slot of SLOTS) {
+        // Already handled?
+        if (sf[slot.sentField] || sf[slot.skipField]) continue;
+
+        const state = classifySlot(slot.offset, dueMs, utcTodayMs);
+        if (state === 'pending') { summary.pending += 1; continue; }
+
+        if (state === 'missed') {
+          summary.skipped += 1;
+          if (dryRun) {
+            summary.plan.push({ action: 'skip', slot: slot.key, email: suShaped.email, rfp: rfpShaped.name });
+          } else {
+            try {
+              await airtable(SIGNUPS_TABLE, {
+                method: 'PATCH',
+                query: `/${su.id}`,
+                body: { fields: { [slot.skipField]: true }, typecast: true },
+              });
+            } catch (e) {
+              summary.errors.push(`Skip ${slot.key} for ${suShaped.email}: ${e.message}`);
+            }
+          }
+          continue;
+        }
+
+        // state === 'due' -> send
+        if (!suShaped.email) { summary.errors.push(`Signup ${su.id} has no email`); continue; }
+
+        if (dryRun) {
+          summary.sent += 1;
+          summary.plan.push({ action: 'send', slot: slot.key, offset: slot.offset, email: suShaped.email, rfp: rfpShaped.name });
+          continue;
+        }
+
+        const { subject, text } = buildReminderEmail(rfpShaped, suShaped, slot.offset);
+        try {
+          await sendViaSendGrid({ to: suShaped.email, subject, text, rfpId: rec.id });
+          await airtable(SIGNUPS_TABLE, {
+            method: 'PATCH',
+            query: `/${su.id}`,
+            body: { fields: { [slot.sentField]: new Date().toISOString(), [F.suMailStatus]: `sent ${slot.key}` }, typecast: true },
+          });
+          summary.sent += 1;
+          console.log(`[rfp] reminder ${slot.key} (D-${slot.offset}) -> ${suShaped.email} for "${rfpShaped.name}"`);
+        } catch (e) {
+          // Don't stamp sent — leave it for the next sweep to retry.
+          summary.errors.push(`Send ${slot.key} to ${suShaped.email}: ${e.message}`);
+          try {
+            await airtable(SIGNUPS_TABLE, {
+              method: 'PATCH',
+              query: `/${su.id}`,
+              body: { fields: { [F.suMailStatus]: `error: ${String(e.message).slice(0, 80)}` }, typecast: true },
+            });
+          } catch { /* status write is best-effort */ }
+        }
+      }
+    }
+  }
+
+  summary.finished = new Date().toISOString();
+  return summary;
+}
+
+// POST /api/cron/sweep -----------------------------------------------------
+// Manual trigger + test hook. Body/query { dryRun: true } or ?dry=1 reports
+// what it *would* do without sending or writing anything.
+router.post('/cron/sweep', async (req, res) => {
+  if (CRON_SECRET) {
+    const supplied = req.get('x-cron-secret') || req.query.secret;
+    if (supplied !== CRON_SECRET) return res.status(401).json({ error: 'Bad or missing cron secret' });
+  }
+  const dryRun = req.body?.dryRun === true || req.query.dry === '1' || req.query.dry === 'true';
+  try {
+    const summary = await sweepOnce({ dryRun });
+    res.json(summary);
+  } catch (e) {
+    console.error('[rfp] sweep failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// In-process hourly scheduler ----------------------------------------------
+// The Railway web service runs 24/7, so a plain interval is enough — no extra
+// service or dependency. Single instance only; if you ever scale to multiple
+// replicas, move this to one dedicated worker to avoid double-sends.
+let sweeping = false;
+async function scheduledSweep() {
+  if (sweeping) return; // don't overlap runs
+  sweeping = true;
+  try {
+    const s = await sweepOnce({ dryRun: false });
+    if (s.sent || s.skipped || s.errors.length) {
+      console.log(`[rfp] sweep: ${s.sent} sent, ${s.skipped} skipped, ${s.pending} pending, ${s.errors.length} errors`);
+      for (const err of s.errors) console.warn('[rfp]   ', err);
+    }
+  } catch (e) {
+    console.error('[rfp] scheduled sweep crashed:', e.message);
+  } finally {
+    sweeping = false;
+  }
+}
+
+if (CRON_ENABLED && configured()) {
+  // Wait a beat after boot so the server is fully up, then run hourly.
+  setTimeout(scheduledSweep, 30_000).unref?.();
+  setInterval(scheduledSweep, 60 * 60 * 1000).unref?.();
+  console.log(`[rfp] reminder scheduler on (hourly, grace ${GRACE_DAYS}d)`);
+} else {
+  console.log('[rfp] reminder scheduler off' + (configured() ? ' (RFP_CRON_ENABLED=false)' : ' (Airtable not configured)'));
+}
 
 export default router;
