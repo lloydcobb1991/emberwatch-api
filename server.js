@@ -46,6 +46,7 @@ app.get('/', (_req, res) => {
 });
 app.use('/api', contactsRouter);
 app.use('/api', brandNewsRouter); 
+app.use('/api', rfpRouter);
 // ----------------------------------------------------------------------------
 // POST /api/analyze
 // Pass-through proxy to Anthropic. Frontend builds the full Claude request
