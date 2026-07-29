@@ -750,4 +750,61 @@ router.get('/wp/ping', async (req, res) => {
   }
 });
 
+// POST /api/rfp/:id/landing --------------------------------------------------
+// Clone a WordPress template into a filled landing page for this RFP, then save
+// the new page's id + URL back onto the RFP row.
+// Body: { template_page_id: number, status?: 'draft'|'publish' }
+router.post('/rfp/:id/landing', async (req, res) => {
+  if (!configured()) return notConfigured(res);
+  if (!wpConfigured()) return res.status(400).json({ error: 'WordPress not configured (need WP_API_URL, WP_USER, WP_APP_PASSWORD)' });
+
+  const status = req.body?.status === 'publish' ? 'publish' : 'draft';
+
+  try {
+    let record;
+    try {
+      record = await airtable(RFPS_TABLE, { query: `/${encodeURIComponent(req.params.id)}` });
+    } catch (e) {
+      if (e.status === 404) return res.status(404).json({ error: 'RFP not found' });
+      throw e;
+    }
+    const rfp = shapeRfp(record);
+
+    const templatePageId = Number(req.body?.template_page_id || rfp.template_id);
+    if (!templatePageId) {
+      return res.status(400).json({ error: 'template_page_id is required (or set template_id on the RFP first)' });
+    }
+
+    const acf = {
+      rfp_logo: rfp.logo_url || '',
+      rfp_description: rfp.description || '',
+      rfp_deadline: rfp.deadline || '',
+      rfp_client: rfp.client || '',
+      rfp_id: rfp.id,
+    };
+
+    const wp = await wpFetch('/ics/v1/clone-landing', {
+      method: 'POST',
+      body: { template_page_id: templatePageId, title: rfp.name || 'RFP Landing', status, acf },
+    });
+
+    // Persist the page id + URL (and the template used) back onto the RFP.
+    const updated = await airtable(RFPS_TABLE, {
+      method: 'PATCH',
+      query: `/${encodeURIComponent(req.params.id)}`,
+      body: {
+        fields: { [F.wpPageId]: String(wp.id), [F.lpUrl]: wp.url, [F.templateId]: String(templatePageId) },
+        typecast: true,
+      },
+    });
+
+    console.log(`[rfp] landing page ${wp.id} (${wp.status}) for "${rfp.name}" -> ${wp.url}`);
+    res.status(201).json({ rfp: shapeRfp(updated), landing: wp });
+  } catch (e) {
+    console.error('[rfp] landing creation failed:', e.message, e.detail || '');
+    const code = e.status && e.status >= 400 && e.status < 600 ? e.status : 500;
+    res.status(code).json({ error: e.message, detail: e.detail || null });
+  }
+});
+
 export default router;
