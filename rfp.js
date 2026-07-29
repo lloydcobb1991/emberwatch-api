@@ -87,6 +87,45 @@ const SLOTS = [
   { key: 'fu3', offset: 1, sentField: F.suFu3, skipField: F.suFu3Skip },
 ];
 
+// --- WordPress config ------------------------------------------------------
+// Used to create RFP landing pages. Set WP_API_URL to staging now, flip it to
+// production later — no code change needed. The app password may contain spaces
+// as WordPress displays it; they're stripped here.
+const WP_URL = (process.env.WP_API_URL || '').replace(/\/+$/, '');
+const WP_USER = process.env.WP_USER || '';
+const WP_APP_PASSWORD = (process.env.WP_APP_PASSWORD || '').replace(/\s+/g, '');
+const wpConfigured = () => Boolean(WP_URL && WP_USER && WP_APP_PASSWORD);
+
+function wpAuthHeader() {
+  return `Basic ${Buffer.from(`${WP_USER}:${WP_APP_PASSWORD}`).toString('base64')}`;
+}
+
+async function wpFetch(path, { method = 'GET', body } = {}) {
+  const res = await fetch(`${WP_URL}/wp-json${path}`, {
+    method,
+    headers: { Authorization: wpAuthHeader(), 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    // A Basic Auth wall or an HTML error page shows up here as non-JSON.
+    const err = new Error(`WordPress returned non-JSON (${res.status}) — the site may still be behind Basic Auth or the URL is wrong`);
+    err.status = 502;
+    err.detail = text.slice(0, 200);
+    throw err;
+  }
+  if (!res.ok) {
+    const err = new Error(data?.message || `WordPress error ${res.status}`);
+    err.status = res.status;
+    err.detail = data?.code || null;
+    throw err;
+  }
+  return data;
+}
+
 // ---------------------------------------------------------------------------
 // Airtable helpers
 // ---------------------------------------------------------------------------
@@ -667,5 +706,48 @@ if (CRON_ENABLED && configured()) {
 } else {
   console.log('[rfp] reminder scheduler off' + (configured() ? ' (RFP_CRON_ENABLED=false)' : ' (Airtable not configured)'));
 }
+
+// ===========================================================================
+// WordPress — connection test (landing-page creation comes next)
+// ===========================================================================
+
+// GET /api/wp/ping — confirms the app password authenticates and reports who
+// we're connected as, plus whether the ACF landing fields are exposed to REST.
+router.get('/wp/ping', async (req, res) => {
+  if (!wpConfigured()) {
+    return res.status(200).json({
+      ok: false,
+      error: 'WordPress not configured',
+      need: ['WP_API_URL', 'WP_USER', 'WP_APP_PASSWORD'].filter((v) => !process.env[v]),
+    });
+  }
+  try {
+    const me = await wpFetch('/wp/v2/users/me?context=edit');
+    const canPublish = Boolean(me.capabilities?.publish_pages ?? me.capabilities?.edit_pages ?? true);
+
+    // Best-effort ACF check: read one page in edit context and see if an `acf`
+    // key comes back. On a site with no pages yet this is inconclusive, so we
+    // report it as unknown rather than a failure.
+    let acfExposed = 'unknown';
+    try {
+      const pages = await wpFetch('/wp/v2/pages?per_page=1&context=edit&status=any');
+      if (Array.isArray(pages) && pages.length) {
+        acfExposed = Object.prototype.hasOwnProperty.call(pages[0], 'acf');
+      }
+    } catch { /* non-fatal */ }
+
+    res.json({
+      ok: true,
+      connectedAs: me.name,
+      username: me.slug,
+      userId: me.id,
+      canPublishPages: canPublish,
+      acfExposedToRest: acfExposed,
+      wp: WP_URL,
+    });
+  } catch (e) {
+    res.status(200).json({ ok: false, status: e.status || null, error: e.message, detail: e.detail || null });
+  }
+});
 
 export default router;
